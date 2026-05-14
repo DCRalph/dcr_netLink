@@ -4,8 +4,8 @@
 #include <files/IFileStorage.h>
 #include <fatalHandler/FatalHandler.h>
 #include <taskManager/TaskManager.h>
-#include <rtosUtils/FreeRtosRaii.h>
-#include <rtosUtils/MutexRegistry.h>
+#include <taskManager/FreeRtosRaii.h>
+#include <taskManager/MutexRegistry.h>
 #include <logger/Logger.h>
 #include "esp_netif.h"
 #include "esp_wifi.h"
