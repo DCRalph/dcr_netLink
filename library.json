@@ -1,0 +1,29 @@
+{
+  "name": "dcr_net_link",
+  "version": "1.0.0",
+  "description": "ESP32 WiFi state machine and credential storage.",
+  "keywords": "esp32, arduino, wifi, network, credentials",
+  "frameworks": "arduino",
+  "platforms": [
+    "espressif32"
+  ],
+  "authors": {
+    "name": "William Giles",
+    "email": "me@williamgiles.co.nz",
+    "url": "https://github.com/DCRalph"
+  },
+  "dependencies": {
+    "bblanchon/ArduinoJson": "^7"
+  },
+  "build": {
+    "srcDir": ".",
+    "includeDir": ".",
+    "unflags": [
+      "-std=gnu++11",
+      "-std=gnu++14"
+    ],
+    "flags": [
+      "-std=gnu++17"
+    ]
+  }
+}
