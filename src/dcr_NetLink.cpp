@@ -1173,7 +1173,7 @@ bool NetLink::_loadSavedNetworks(std::vector<SavedWiFiNetwork> &out, bool includ
     return !out.empty();
   }
 
-  DynamicJsonDocument doc(3072);
+  JsonDocument doc;
   DeserializationError err = deserializeJson(doc, raw);
   free(raw);
 
@@ -1265,14 +1265,14 @@ bool NetLink::_saveSavedNetworks(const std::vector<SavedWiFiNetwork> &networks) 
   factoryNetwork.password = _factoryPassword;
   persisted.push_back(factoryNetwork);
 
-  DynamicJsonDocument doc(3072);
-  JsonArray arr = doc.createNestedArray("networks");
+  JsonDocument doc;
+  JsonArray arr = doc["networks"].to<JsonArray>();
 
   for (const SavedWiFiNetwork &n : persisted)
   {
     if (n.ssid.isEmpty())
       continue;
-    JsonObject obj = arr.createNestedObject();
+    JsonObject obj = arr.add<JsonObject>();
     obj["ssid"] = n.ssid;
     obj["password"] = n.password;
     if (n.lastConnectedUnix != 0U)
@@ -1300,7 +1300,7 @@ void NetLink::_migrateLegacyCredentialsIfNeeded()
   char *raw = Files::getFileAsString(WIFI_NETWORKS_FILE);
   if (raw)
   {
-    DynamicJsonDocument doc(3072);
+    JsonDocument doc;
     const DeserializationError err = deserializeJson(doc, raw);
     free(raw);
 
