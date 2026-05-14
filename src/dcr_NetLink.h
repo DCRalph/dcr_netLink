@@ -4,8 +4,8 @@
 #include <WiFi.h>
 #include <vector>
 
-#include "netLink/INetLink.h"
-#include "netLink/NetLinkEvents.h"
+#include "dcr_INetLink.h"
+#include "dcr_NetLinkEvents.h"
 
 // =============================================================================
 // Timing

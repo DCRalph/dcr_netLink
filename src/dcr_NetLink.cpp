@@ -1,12 +1,12 @@
-#include "netLink/NetLink.h"
+#include "dcr_NetLink.h"
 
-#include <files/Files.h>
-#include <files/IFileStorage.h>
-#include <fatalHandler/FatalHandler.h>
-#include <taskManager/TaskManager.h>
-#include <taskManager/FreeRtosRaii.h>
-#include <taskManager/MutexRegistry.h>
-#include <logger/Logger.h>
+#include <dcr_Files.h>
+#include <dcr_IFileStorage.h>
+#include <dcr_FatalHandler.h>
+#include <dcr_TaskManager.h>
+#include <dcr_FreeRtosRaii.h>
+#include <dcr_MutexRegistry.h>
+#include <dcr_Logger.h>
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include <ArduinoJson.h>
