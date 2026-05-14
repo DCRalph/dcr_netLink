@@ -1,6 +1,7 @@
 {
   "name": "dcr_net_link",
   "version": "1.0.0",
+  "license": "AGPL-3.0",
   "description": "ESP32 WiFi state machine and credential storage.",
   "keywords": "esp32, arduino, wifi, network, credentials",
   "frameworks": "arduino",
