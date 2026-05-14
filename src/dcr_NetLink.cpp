@@ -4,8 +4,8 @@
 #include <dcr_IFileStorage.h>
 #include <dcr_FatalHandler.h>
 #include <dcr_TaskManager.h>
-#include <dcr_FreeRtosRaii.h>
-#include <dcr_MutexRegistry.h>
+#include <dcr_taskManager/dcr_FreeRtosRaii.h>
+#include <dcr_taskManager/dcr_MutexRegistry.h>
 #include <dcr_Logger.h>
 #include "esp_netif.h"
 #include "esp_wifi.h"
