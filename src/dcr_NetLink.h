@@ -169,6 +169,7 @@ private:
     void _scheduleConnectRetry(const char *reason, uint32_t delayMs);
     void _serviceScanIfReady();
     bool _buildPlanFromScan(int8_t scanResult);
+    void _logAttemptPlan() const;
     bool _startNextAttempt();
     bool _failCurrentAttempt(const char *reason);
     void _serviceConnectionAttempt();

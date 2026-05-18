@@ -809,6 +809,7 @@ void NetLink::_serviceScanIfReady()
     return;
   }
 
+  _logAttemptPlan();
   _startNextAttempt();
 }
 
@@ -896,6 +897,36 @@ bool NetLink::_buildPlanFromScan(int8_t scanResult)
 
   WiFi.scanDelete();
   return anyCandidates;
+}
+
+void NetLink::_logAttemptPlan() const
+{
+  if (_plan.empty())
+    return;
+
+  debugI("WiFi connect candidate list (%u SSID(s)):", static_cast<unsigned>(_plan.size()));
+  for (size_t planIdx = 0; planIdx < _plan.size(); ++planIdx)
+  {
+    const AttemptPlan &p = _plan[planIdx];
+    const char *passwordLabel = p.password.isEmpty() ? "(open)" : p.password.c_str();
+    const char *preferredLabel = p.preferredBssid.isEmpty() ? "(none)" : p.preferredBssid.c_str();
+    debugI("  [%u] SSID: %s  password: %s  preferred BSSID: %s  (%u BSSID candidate(s))",
+           static_cast<unsigned>(planIdx + 1),
+           p.ssid.c_str(),
+           passwordLabel,
+           preferredLabel,
+           static_cast<unsigned>(p.candidates.size()));
+
+    for (size_t candIdx = 0; candIdx < p.candidates.size(); ++candIdx)
+    {
+      const BssidCandidate &c = p.candidates[candIdx];
+      debugI("      [%u] BSSID %s  channel %ld  RSSI %d",
+             static_cast<unsigned>(candIdx + 1),
+             formatBssid(c.bssid).c_str(),
+             static_cast<long>(c.channel),
+             c.rssi);
+    }
+  }
 }
 
 bool NetLink::_startNextAttempt()
