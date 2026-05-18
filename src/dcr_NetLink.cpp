@@ -37,7 +37,7 @@ namespace
   constexpr uint32_t WIFI_SCAN_TASK_STACK_SIZE = 6144;
   constexpr UBaseType_t WIFI_SCAN_TASK_PRIORITY = 1;
   constexpr BaseType_t WIFI_SCAN_TASK_CORE = tskNO_AFFINITY;
-  constexpr uint32_t WIFI_SCAN_RETRY_MS = 1000;
+  constexpr uint32_t WIFI_SCAN_RETRY_MS = 3000;
   constexpr uint32_t WIFI_CONNECT_RETRY_MS = 1000;
 
   // DNS handling runs once per association. GOT_IP can fire again on DHCP
