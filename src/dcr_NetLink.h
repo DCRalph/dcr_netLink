@@ -105,7 +105,7 @@ public:
     void prepareForExternalTransport();
 
     // === Saved credentials ===
-    bool saveCredentials(const char *ssid, const char *password);
+    bool saveCredentials(const char *ssid, const char *password, bool hidden = false);
     bool forgetNetwork(const char *ssid);
     bool hasSavedCredentials() const;
     std::vector<SavedWiFiNetwork> getSavedNetworks() const;

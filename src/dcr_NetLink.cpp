@@ -1475,7 +1475,7 @@ std::vector<SavedWiFiNetwork> NetLink::getSavedNetworks() const
   return networks;
 }
 
-bool NetLink::saveCredentials(const char *ssid, const char *password)
+bool NetLink::saveCredentials(const char *ssid, const char *password, bool hidden)
 {
   if (!ssid || strlen(ssid) == 0)
     return false;
@@ -1507,6 +1507,7 @@ bool NetLink::saveCredentials(const char *ssid, const char *password)
   n.password = password ? password : "";
   n.lastConnectedUnix = lastConn;
   n.lastSuccessfulBssid = lastBssid;
+  n.hidden = hidden;
   networks.insert(networks.begin(), n);
 
   if (networks.size() > MAX_SAVED_NETWORKS)
