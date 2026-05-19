@@ -53,6 +53,7 @@ struct SavedWiFiNetwork
     String password;
     uint32_t lastConnectedUnix = 0;
     String lastSuccessfulBssid;
+    bool hidden = false;
 };
 
 // =============================================================================

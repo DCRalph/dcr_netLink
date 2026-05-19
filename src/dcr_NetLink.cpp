@@ -881,6 +881,15 @@ bool NetLink::_buildPlanFromScan(int8_t scanResult)
                        return a.rssi > b.rssi;
                      });
 
+    // Hidden networks do not appear in passive scan results. Always append a
+    // wildcard candidate (zero BSSID / channel 0) so _startNextAttempt issues
+    // WiFi.begin(ssid, password) and the driver actively probes for it.
+    if (net.hidden)
+    {
+      plan.candidates.push_back(BssidCandidate{});
+      debugI("Queued wildcard candidate for hidden SSID %s.", plan.ssid.c_str());
+    }
+
     if (!plan.candidates.empty())
     {
       anyCandidates = true;
@@ -947,11 +956,24 @@ bool NetLink::_startNextAttempt()
       _attemptStartMs = millis();
       _attemptDisconnectBaselineSeq = s_disconnectEventSeq.load(std::memory_order_relaxed);
 
-      debugI("Attempting SSID %s via BSSID %s on channel %d (%d/%d, RSSI %d)", p.ssid.c_str(), formatBssid(c.bssid).c_str(), c.channel, c.attempts, WIFI_BSSID_ATTEMPTS_PER_AP, c.rssi);
+      const uint8_t zeroBssid[6] = {0, 0, 0, 0, 0, 0};
+      const bool wildcard = memcmp(c.bssid, zeroBssid, 6) == 0;
+
+      if (wildcard)
+      {
+        debugI("Attempting hidden SSID %s with active probe (%d/%d)", p.ssid.c_str(), c.attempts, WIFI_BSSID_ATTEMPTS_PER_AP);
+      }
+      else
+      {
+        debugI("Attempting SSID %s via BSSID %s on channel %d (%d/%d, RSSI %d)", p.ssid.c_str(), formatBssid(c.bssid).c_str(), c.channel, c.attempts, WIFI_BSSID_ATTEMPTS_PER_AP, c.rssi);
+      }
 
       const char *pw = p.password.isEmpty() ? nullptr : p.password.c_str();
       WiFi.disconnect(false, false);
-      WiFi.begin(p.ssid.c_str(), pw, c.channel, c.bssid);
+      if (wildcard)
+        WiFi.begin(p.ssid.c_str(), pw);
+      else
+        WiFi.begin(p.ssid.c_str(), pw, c.channel, c.bssid);
       return true;
     }
 
@@ -1235,6 +1257,7 @@ bool NetLink::_loadSavedNetworks(std::vector<SavedWiFiNetwork> &out, bool includ
     n.password = obj["password"] | "";
     n.lastConnectedUnix = obj["lastConnected"] | 0U;
     n.lastSuccessfulBssid = obj["lastSuccessfulBssid"] | "";
+    n.hidden = obj["hidden"] | false;
 
     if (_isFactoryNetworkSsid(ssid))
     {
@@ -1254,6 +1277,7 @@ bool NetLink::_loadSavedNetworks(std::vector<SavedWiFiNetwork> &out, bool includ
     {
       factoryNetwork.ssid = _factorySsid;
       factoryNetwork.password = _factoryPassword;
+      factoryNetwork.hidden = true;
       out.push_back(factoryNetwork);
     }
     else
@@ -1294,6 +1318,7 @@ bool NetLink::_saveSavedNetworks(const std::vector<SavedWiFiNetwork> &networks) 
 
   factoryNetwork.ssid = _factorySsid;
   factoryNetwork.password = _factoryPassword;
+  factoryNetwork.hidden = true;
   persisted.push_back(factoryNetwork);
 
   JsonDocument doc;
@@ -1310,6 +1335,8 @@ bool NetLink::_saveSavedNetworks(const std::vector<SavedWiFiNetwork> &networks) 
       obj["lastConnected"] = n.lastConnectedUnix;
     if (!n.lastSuccessfulBssid.isEmpty())
       obj["lastSuccessfulBssid"] = n.lastSuccessfulBssid;
+    if (n.hidden)
+      obj["hidden"] = true;
   }
 
   String s;
@@ -1323,6 +1350,9 @@ void NetLink::_ensureFactoryNetwork(std::vector<SavedWiFiNetwork> &networks) con
   SavedWiFiNetwork factoryNetwork;
   factoryNetwork.ssid = _factorySsid;
   factoryNetwork.password = _factoryPassword;
+  // Factory / commissioning APs are typically hidden so the scheduler must
+  // probe for them rather than rely on passive scan results.
+  factoryNetwork.hidden = true;
   networks.push_back(factoryNetwork);
 }
 
