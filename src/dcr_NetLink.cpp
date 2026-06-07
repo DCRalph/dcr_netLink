@@ -985,7 +985,16 @@ bool NetLink::_startNextAttempt()
   _connectInProgress = false;
   _scanPending = false;
   debugI("Exhausted all WiFi candidates.");
-  _scheduleConnectRetry("All WiFi candidates exhausted.", WIFI_CONNECT_RETRY_MS);
+
+  // A full scan + connect sweep failed for every candidate (commonly the radio
+  // wedged into repeated AUTH_FAIL / WL_CONNECT_FAILED). A bare disconnect +
+  // rescan reuses the same wedged driver state and loops forever, so power-cycle
+  // the whole WiFi stack here. _serviceDisconnectRecovery() turns the radio back
+  // on after WIFI_RECONNECT_POWER_CYCLE_DELAY_MS and reconnects from scratch.
+  _turnOnAfterMs = millis() + WIFI_RECONNECT_POWER_CYCLE_DELAY_MS;
+  _doOff();
+  debugW("All WiFi candidates exhausted. Restarting WiFi stack; reconnecting in %lu ms.",
+         static_cast<unsigned long>(WIFI_RECONNECT_POWER_CYCLE_DELAY_MS));
   return false;
 }
 
