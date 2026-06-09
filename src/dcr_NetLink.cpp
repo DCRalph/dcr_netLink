@@ -33,7 +33,10 @@ namespace
 namespace
 {
   constexpr uint8_t WIFI_BSSID_ATTEMPTS_PER_AP = 2;
-  constexpr uint32_t WIFI_DISCONNECT_EVENT_GRACE_MS = 750;
+  // After aborting a previous attempt with WiFi.disconnect(), wait this long
+  // before capturing the disconnect-event baseline so the aborted attempt's
+  // async STA_DISCONNECTED event is not attributed to the new attempt.
+  constexpr uint32_t WIFI_DISCONNECT_FLUSH_MS = 100;
   constexpr uint32_t WIFI_SCAN_TASK_STACK_SIZE = 6144;
   constexpr UBaseType_t WIFI_SCAN_TASK_PRIORITY = 1;
   constexpr BaseType_t WIFI_SCAN_TASK_CORE = tskNO_AFFINITY;
@@ -50,6 +53,10 @@ namespace
   // HTTP connection pool (HTTP::ConnectionPool) can read it from other tasks
   // to detect a stale cached socket fd after a WiFi blip.
   std::atomic<uint32_t> s_disconnectEventSeq{0};
+
+  // Reason code of the most recent STA_DISCONNECTED event, for attempt-failure
+  // logging. Written by the WiFi event task, read by the scheduler.
+  std::atomic<uint8_t> s_lastDisconnectReason{0};
 
   String formatBssid(const uint8_t *bssid)
   {
@@ -208,6 +215,8 @@ namespace
 
             case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
                 s_dnsOverrideApplied = false;
+                s_lastDisconnectReason.store(info.wifi_sta_disconnected.reason,
+                                             std::memory_order_relaxed);
                 s_disconnectEventSeq.fetch_add(1, std::memory_order_relaxed);
                 debugW("Disconnected | reason %d (%s) | BSSID %s | last RSSI %d",
                        info.wifi_sta_disconnected.reason,
@@ -259,6 +268,15 @@ namespace
   void configureStationMode()
   {
     WiFi.persistent(false);
+
+    // NetLink owns reconnection. The Arduino core's auto-reconnect re-issues
+    // WiFi.begin() with the last config — including a stale pinned BSSID and
+    // channel — and races the scheduler's candidate sweep.
+    WiFi.setAutoReconnect(false);
+
+    // The core default (WPA2) rejects WPA/TKIP-only home routers outright.
+    WiFi.setMinSecurity(WIFI_AUTH_WPA_PSK);
+
     WiFi.mode(WIFI_STA);
 
     const esp_err_t err = esp_wifi_set_storage(WIFI_STORAGE_RAM);
@@ -336,7 +354,8 @@ void NetLink::init()
   _usingFactoryCreds = false;
   _bootAutoConnectPending = true;
   _bootAutoConnectAt = millis() + WIFI_BOOT_CONNECT_DELAY_MS;
-  debugD("Delaying boot auto-connect by 10 seconds.");
+  debugD("Delaying boot auto-connect by %lu ms.",
+         static_cast<unsigned long>(WIFI_BOOT_CONNECT_DELAY_MS));
 }
 
 void NetLink::loop()
@@ -571,6 +590,8 @@ void NetLink::_doOn()
 
 void NetLink::_doOff()
 {
+  // Cancel any queued drop-triggered reconnect; turning the radio off wins.
+  _pending &= ~PendingConnect;
   _bootAutoConnectPending = false;
   _bootAutoConnectAt = 0;
   _resetScheduler();
@@ -884,10 +905,14 @@ bool NetLink::_buildPlanFromScan(int8_t scanResult)
     // Hidden networks do not appear in passive scan results. Always append a
     // wildcard candidate (zero BSSID / channel 0) so _startNextAttempt issues
     // WiFi.begin(ssid, password) and the driver actively probes for it.
-    if (net.hidden)
+    // Visible networks get the same wildcard as a last-resort fallback: it
+    // covers APs that changed channel since the scan and lets the driver pick
+    // any AP of the SSID instead of the pinned ones.
+    if (net.hidden || !plan.candidates.empty())
     {
       plan.candidates.push_back(BssidCandidate{});
-      debugI("Queued wildcard candidate for hidden SSID %s.", plan.ssid.c_str());
+      debugI("Queued wildcard candidate for SSID %s%s.", plan.ssid.c_str(),
+             net.hidden ? " (hidden)" : "");
     }
 
     if (!plan.candidates.empty())
@@ -953,15 +978,13 @@ bool NetLink::_startNextAttempt()
       }
 
       ++c.attempts;
-      _attemptStartMs = millis();
-      _attemptDisconnectBaselineSeq = s_disconnectEventSeq.load(std::memory_order_relaxed);
 
       const uint8_t zeroBssid[6] = {0, 0, 0, 0, 0, 0};
       const bool wildcard = memcmp(c.bssid, zeroBssid, 6) == 0;
 
       if (wildcard)
       {
-        debugI("Attempting hidden SSID %s with active probe (%d/%d)", p.ssid.c_str(), c.attempts, WIFI_BSSID_ATTEMPTS_PER_AP);
+        debugI("Attempting SSID %s without BSSID pin (%d/%d)", p.ssid.c_str(), c.attempts, WIFI_BSSID_ATTEMPTS_PER_AP);
       }
       else
       {
@@ -969,11 +992,18 @@ bool NetLink::_startNextAttempt()
       }
 
       const char *pw = p.password.isEmpty() ? nullptr : p.password.c_str();
+      // Abort any previous attempt, then let its async STA_DISCONNECTED event
+      // drain before baselining the event counter. Without the flush, the
+      // aborted attempt's event lands after the baseline is captured and the
+      // new attempt gets failed as "disconnected" mid-handshake.
       WiFi.disconnect(false, false);
+      vTaskDelay(pdMS_TO_TICKS(WIFI_DISCONNECT_FLUSH_MS));
+      _attemptDisconnectBaselineSeq = s_disconnectEventSeq.load(std::memory_order_relaxed);
       if (wildcard)
         WiFi.begin(p.ssid.c_str(), pw);
       else
         WiFi.begin(p.ssid.c_str(), pw, c.channel, c.bssid);
+      _attemptStartMs = millis();
       return true;
     }
 
@@ -1050,24 +1080,20 @@ void NetLink::_serviceConnectionAttempt()
     return;
   }
 
-  const wl_status_t status = WiFi.status();
-  if (status == WL_CONNECT_FAILED)
+  // WiFi.status() is sticky: it is only updated by events, never reset by
+  // WiFi.begin()/disconnect(). A WL_CONNECT_FAILED or WL_NO_SSID_AVAIL left
+  // over from the previous candidate would instantly fail every following
+  // attempt in the sweep. Detect failure from the disconnect-event counter
+  // instead — ESP-IDF emits exactly one STA_DISCONNECTED per failed attempt.
+  const uint32_t seq = s_disconnectEventSeq.load(std::memory_order_relaxed);
+  if (_attemptStartMs > 0 && seq > _attemptDisconnectBaselineSeq)
   {
-    _failCurrentAttempt("WiFi driver reported WL_CONNECT_FAILED");
-    return;
-  }
-  if (status == WL_NO_SSID_AVAIL)
-  {
-    _failCurrentAttempt("WiFi driver reported WL_NO_SSID_AVAIL");
-    return;
-  }
-
-  if (_attemptStartMs > 0 &&
-      s_disconnectEventSeq.load(std::memory_order_relaxed) > _attemptDisconnectBaselineSeq &&
-      now - _attemptStartMs >= WIFI_DISCONNECT_EVENT_GRACE_MS)
-  {
-    _attemptDisconnectBaselineSeq = s_disconnectEventSeq.load(std::memory_order_relaxed);
-    _failCurrentAttempt("Disconnected during association");
+    _attemptDisconnectBaselineSeq = seq;
+    char reason[64];
+    snprintf(reason, sizeof(reason), "Disconnected during attempt (reason %s)",
+             wifiDisconnectReasonToString(
+                 s_lastDisconnectReason.load(std::memory_order_relaxed)));
+    _failCurrentAttempt(reason);
   }
 }
 
@@ -1105,6 +1131,19 @@ void NetLink::_refreshConnectionState()
     _state = WiFiState::WiFiDisconnected;
     _disconnectionStartTime = millis();
     _usingFactoryCreds = false;
+
+    // Unexpected drop (deliberate disconnects go through _doDisconnect and
+    // never reach this branch). With the core's auto-reconnect disabled,
+    // nothing else restores the link until the 3-minute recovery radio cycle,
+    // so queue a reconnect now. The fresh scan also picks the best AP, which
+    // matters on multi-AP deployments after the previous AP steered us away.
+    if (!(_cb.isCellularPreferred && _cb.isCellularPreferred()))
+    {
+      _pending |= PendingConnect;
+      debugW("WiFi connection lost (reason %s); reconnecting now.",
+             wifiDisconnectReasonToString(
+                 s_lastDisconnectReason.load(std::memory_order_relaxed)));
+    }
   }
 }
 
