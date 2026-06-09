@@ -210,6 +210,8 @@ private:
     size_t _planIdx = 0;
     size_t _candidateIdx = 0;
     unsigned long _attemptStartMs = 0;
+    // Backoff deadline between failed attempts; 0 when no attempt is deferred.
+    unsigned long _nextAttemptAt = 0;
     uint32_t _attemptDisconnectBaselineSeq = 0;
     bool _connectInProgress = false;
 

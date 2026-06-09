@@ -37,6 +37,10 @@ namespace
   // before capturing the disconnect-event baseline so the aborted attempt's
   // async STA_DISCONNECTED event is not attributed to the new attempt.
   constexpr uint32_t WIFI_DISCONNECT_FLUSH_MS = 100;
+  // Pause between a failed attempt and the next one. Retrying the instant an
+  // AUTH_FAIL arrives trips auth rate-limiting on some APs, and band-steering
+  // controllers deliberately reject the first rapid 2.4 GHz auth attempts.
+  constexpr uint32_t WIFI_ATTEMPT_BACKOFF_MS = 1500;
   constexpr uint32_t WIFI_SCAN_TASK_STACK_SIZE = 6144;
   constexpr UBaseType_t WIFI_SCAN_TASK_PRIORITY = 1;
   constexpr BaseType_t WIFI_SCAN_TASK_CORE = tskNO_AFFINITY;
@@ -673,6 +677,7 @@ void NetLink::_resetScheduler()
   ++_scanRequestId; // Invalidate any in-flight worker result.
   _attemptDisconnectBaselineSeq = s_disconnectEventSeq.load(std::memory_order_relaxed);
   _attemptStartMs = 0;
+  _nextAttemptAt = 0;
   if (!scanWasPending)
   {
     WiFi.scanDelete();
@@ -780,6 +785,7 @@ void NetLink::_scheduleConnectRetry(const char *reason, uint32_t delayMs)
   _scanPending = false;
   _scanResultReady = false;
   _attemptStartMs = 0;
+  _nextAttemptAt = 0;
   _retryConnectAt = millis() + delayMs;
   WiFi.disconnect(false, false);
   debugW("%s Retrying WiFi connect loop in %lu ms.", reason,
@@ -999,10 +1005,26 @@ bool NetLink::_startNextAttempt()
       WiFi.disconnect(false, false);
       vTaskDelay(pdMS_TO_TICKS(WIFI_DISCONNECT_FLUSH_MS));
       _attemptDisconnectBaselineSeq = s_disconnectEventSeq.load(std::memory_order_relaxed);
+
+      // Set the config without connecting so sae_pwe_h2e can be patched in
+      // first. Arduino leaves it at 0 (hunt-and-peck only); APs in WPA3/WPA2
+      // transition mode that require H2E then reject the SAE commit with
+      // AUTH_FAIL even though the password is correct.
       if (wildcard)
-        WiFi.begin(p.ssid.c_str(), pw);
+        WiFi.begin(p.ssid.c_str(), pw, 0, nullptr, false);
       else
-        WiFi.begin(p.ssid.c_str(), pw, c.channel, c.bssid);
+        WiFi.begin(p.ssid.c_str(), pw, c.channel, c.bssid, false);
+
+      wifi_config_t cfg;
+      if (esp_wifi_get_config(WIFI_IF_STA, &cfg) == ESP_OK)
+      {
+        cfg.sta.sae_pwe_h2e = WPA3_SAE_PWE_BOTH;
+        esp_wifi_set_config(WIFI_IF_STA, &cfg);
+      }
+
+      const esp_err_t connectErr = esp_wifi_connect();
+      if (connectErr != ESP_OK)
+        debugW("esp_wifi_connect failed: %s", esp_err_to_name(connectErr));
       _attemptStartMs = millis();
       return true;
     }
@@ -1032,19 +1054,23 @@ bool NetLink::_failCurrentAttempt(const char *reason)
 {
   if (!_connectInProgress)
     return false;
-  if (_planIdx >= _plan.size())
-    return _startNextAttempt();
 
-  AttemptPlan &p = _plan[_planIdx];
-  if (_candidateIdx >= p.candidates.size())
-    return _startNextAttempt();
+  if (_planIdx < _plan.size() && _candidateIdx < _plan[_planIdx].candidates.size())
+  {
+    AttemptPlan &p = _plan[_planIdx];
+    BssidCandidate &c = p.candidates[_candidateIdx];
+    debugI("Failed SSID %s via BSSID %s attempt %d/%d: %s", p.ssid.c_str(), formatBssid(c.bssid).c_str(), c.attempts, WIFI_BSSID_ATTEMPTS_PER_AP, reason);
 
-  BssidCandidate &c = p.candidates[_candidateIdx];
-  debugI("Failed SSID %s via BSSID %s attempt %d/%d: %s", p.ssid.c_str(), formatBssid(c.bssid).c_str(), c.attempts, WIFI_BSSID_ATTEMPTS_PER_AP, reason);
+    if (c.attempts >= WIFI_BSSID_ATTEMPTS_PER_AP)
+      ++_candidateIdx;
+  }
 
-  if (c.attempts >= WIFI_BSSID_ATTEMPTS_PER_AP)
-    ++_candidateIdx;
-  return _startNextAttempt();
+  // Abort the failed attempt and back off before starting the next one;
+  // _serviceConnectionAttempt() resumes the sweep when the deadline passes.
+  WiFi.disconnect(false, false);
+  _attemptStartMs = 0;
+  _nextAttemptAt = millis() + WIFI_ATTEMPT_BACKOFF_MS;
+  return true;
 }
 
 void NetLink::_serviceConnectionAttempt()
@@ -1066,6 +1092,17 @@ void NetLink::_serviceConnectionAttempt()
   if (_scanPending)
   {
     _serviceScanIfReady();
+    return;
+  }
+
+  // Backoff window between attempts (set by _failCurrentAttempt).
+  if (_nextAttemptAt != 0)
+  {
+    if (now >= _nextAttemptAt)
+    {
+      _nextAttemptAt = 0;
+      _startNextAttempt();
+    }
     return;
   }
 
@@ -1117,6 +1154,7 @@ void NetLink::_refreshConnectionState()
       _planIdx = 0;
       _candidateIdx = 0;
       _scanPending = false;
+      _nextAttemptAt = 0;
 
       debugI(wasFactory
                  ? "Successfully connected to factory network"
