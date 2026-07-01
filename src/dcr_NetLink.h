@@ -2,6 +2,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <atomic>
 #include <vector>
 
 #include "dcr_INetLink.h"
@@ -202,8 +203,10 @@ private:
     String _factorySsid;
     String _factoryPassword;
 
-    // Bitmask of PendingFlag values.
-    uint8_t _pending = PendingNone;
+    // Bitmask of PendingFlag values. FIX (B1): atomic so the public command
+    // setters (on/off/connect/disconnect/requestSilentReconnect), which run on
+    // other tasks, |= bits without losing loop()'s concurrent &= clears.
+    std::atomic<uint8_t> _pending{PendingNone};
 
     // Connection attempt state.
     std::vector<AttemptPlan> _plan;
@@ -217,10 +220,16 @@ private:
 
     // Async scan task lifecycle.
     TaskHandle_t _scanTask = nullptr;
-    volatile bool _scanResultReady = false;
-    volatile int8_t _scanResult = WIFI_SCAN_FAILED;
-    volatile uint32_t _scanRequestId = 0;
-    volatile uint32_t _scanCompletedRequestId = 0;
+    // FIX (B7): atomic (was volatile) so publishing the scan result -- including
+    // the unlocked path taken when the publish trylock times out -- cannot be
+    // observed torn / stale-after-ready by the reader in loop().
+    std::atomic<bool> _scanResultReady{false};
+    std::atomic<int8_t> _scanResult{static_cast<int8_t>(WIFI_SCAN_FAILED)};
+    std::atomic<uint32_t> _scanRequestId{0};
+    std::atomic<uint32_t> _scanCompletedRequestId{0};
+    // FIX (B2): true while the worker task is inside WiFi.scanNetworks(); loop()
+    // and beginScan() avoid touching the radio during that window.
+    std::atomic<bool> _scanRadioBusy{false};
     bool _scanPending = false;
     unsigned long _retryConnectAt = 0;
 

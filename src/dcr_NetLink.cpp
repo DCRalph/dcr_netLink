@@ -25,6 +25,16 @@ namespace
     static FreeRtosRaii::Mutex m;
     return m;
   }
+
+  // FIX (B3): dedicated short-held mutex for _cachedDetails so getStatus() can
+  // read a consistent snapshot even while loop() holds wifiLoopMutex for a long
+  // body. Held only for the single struct copy on each side, so getStatus()'s
+  // trylock on it practically never times out.
+  FreeRtosRaii::Mutex &cachedDetailsMutex()
+  {
+    static FreeRtosRaii::Mutex m;
+    return m;
+  }
 }
 
 // =============================================================================
@@ -75,6 +85,22 @@ namespace
   bool hasUsableDns(const IPAddress &dns)
   {
     return dns != IPAddress(0, 0, 0, 0);
+  }
+
+  // FIX (B6): add a public resolver as the BACKUP DNS (index 1) without touching
+  // the DHCP-provided primary, so name resolution fails over when the provider's
+  // resolver is present-but-broken while split-horizon / internal names still
+  // resolve via the primary. Best-effort; a fuller fix needs active DNS probing.
+  bool ensureBackupDns()
+  {
+    esp_netif_t *staNetif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (!staNetif)
+      return false;
+
+    esp_netif_dns_info_t dns = {};
+    dns.ip.type = ESP_IPADDR_TYPE_V4;
+    dns.ip.u_addr.ip4.addr = static_cast<uint32_t>(IPAddress(1, 1, 1, 1));
+    return esp_netif_set_dns_info(staNetif, ESP_NETIF_DNS_BACKUP, &dns) == ESP_OK;
   }
 
   bool applyFallbackDns()
@@ -243,7 +269,14 @@ namespace
 
                 if (hasUsableDns(dns1) || hasUsableDns(dns2))
                 {
-                    debugI("DHCP DNS present; keeping provider DNS");
+                    // FIX (B6): if DHCP gave a primary but no secondary resolver,
+                    // add a public backup so resolution fails over when the
+                    // provider resolver is present-but-broken. Provider DNS stays
+                    // primary (split-horizon / internal names still resolve).
+                    if (hasUsableDns(dns1) && !hasUsableDns(dns2) && ensureBackupDns())
+                        debugI("DHCP DNS present; added public backup DNS (1.1.1.1)");
+                    else
+                        debugI("DHCP DNS present; keeping provider DNS");
                     s_dnsOverrideApplied = true;
                     break;
                 }
@@ -374,28 +407,36 @@ void NetLink::loop()
   }
 
   // 1. Process pending commands.
-  if (_pending & PendingTurnOn)
+  // FIX (B2): defer radio commands while the worker scan task is inside
+  // WiFi.scanNetworks() -- issuing WiFi.mode()/disconnect() concurrently with a
+  // running scan can abort it or assert the driver. The pending bits are atomic
+  // and retained, so the commands run on a later iteration once the scan ends
+  // (a few seconds at most). The service/recovery code below still runs.
+  if (!_scanRadioBusy)
   {
-    _doOn();
-    if (_cb.onClosePopup) _cb.onClosePopup("wifi_turn_on");
+    if (_pending & PendingTurnOn)
+    {
+      _doOn();
+      if (_cb.onClosePopup) _cb.onClosePopup("wifi_turn_on");
+    }
+    if (_pending & PendingTurnOff)
+    {
+      _doOff();
+      if (_cb.onClosePopup) _cb.onClosePopup("wifi_turn_off");
+    }
+    if (_pending & PendingDisconnect)
+    {
+      _doDisconnect();
+      if (_cb.onClosePopup) _cb.onClosePopup("wifi_disconnect");
+    }
+    if ((_pending & PendingConnect) && !_scanInProgress)
+    {
+      _doConnect();
+      if (_cb.onClosePopup) _cb.onClosePopup("wifi_connect");
+      _pending &= ~PendingConnect;
+    }
+    _pending &= ~(PendingTurnOn | PendingTurnOff | PendingDisconnect);
   }
-  if (_pending & PendingTurnOff)
-  {
-    _doOff();
-    if (_cb.onClosePopup) _cb.onClosePopup("wifi_turn_off");
-  }
-  if (_pending & PendingDisconnect)
-  {
-    _doDisconnect();
-    if (_cb.onClosePopup) _cb.onClosePopup("wifi_disconnect");
-  }
-  if ((_pending & PendingConnect) && !_scanInProgress)
-  {
-    _doConnect();
-    if (_cb.onClosePopup) _cb.onClosePopup("wifi_connect");
-    _pending &= ~PendingConnect;
-  }
-  _pending &= ~(PendingTurnOn | PendingTurnOff | PendingDisconnect);
 
   // 2. Boot delay and connection state machine.
   if (!_scanInProgress)
@@ -445,7 +486,12 @@ void NetLink::loop()
   // 5. Recovery: cycle the radio after prolonged disconnection.
   if (!_scanInProgress)
     _serviceDisconnectRecovery();
-  _cachedDetails = current;
+  // FIX (B3): publish the cached snapshot under its dedicated short-held mutex so
+  // getStatus()'s lock-timeout fallback never copies a half-assigned String. On
+  // the (near-impossible) trylock miss we skip the update for one cycle rather
+  // than write unsynchronized.
+  if (auto detailsLock = FreeRtosRaii::tryLock(cachedDetailsMutex(), pdMS_TO_TICKS(50)))
+    _cachedDetails = current;
 
   if (playConnectedBuzzer)
   {
@@ -533,8 +579,11 @@ WiFiDetails NetLink::getStatus()
     WiFiDetails d = _buildStatus();
     return d;
   }
-  // Fallback: return last known cached details rather than reading torn state.
-  return _cachedDetails;
+  // FIX (B3): read the cached snapshot under its dedicated short-held mutex so we
+  // never copy _cachedDetails while loop() is mid-assignment (torn String read).
+  if (auto detailsLock = FreeRtosRaii::tryLock(cachedDetailsMutex(), pdMS_TO_TICKS(50)))
+    return _cachedDetails;
+  return WiFiDetails{};
 }
 
 void NetLink::beginScan()
@@ -553,6 +602,12 @@ void NetLink::beginScan()
   _resetScheduler();
   _connectInProgress = false;
   if (_cb.onClosePopup) _cb.onClosePopup("wifi_turn_on");
+
+  // FIX (B2): wait for any in-flight worker scan to finish before we touch the
+  // radio, so we don't abort it / assert the WiFi driver. Bounded (~4s); the
+  // scan task clears _scanRadioBusy as soon as WiFi.scanNetworks() returns.
+  for (int i = 0; i < 40 && _scanRadioBusy; ++i)
+    delay(100);
 
   WiFi.disconnect(true, true);
   WiFi.mode(WIFI_OFF);
@@ -601,6 +656,10 @@ void NetLink::_doOff()
   _resetScheduler();
   _connectInProgress = false;
   _retryConnectAt = 0;
+  // FIX (B4): cancel any pending recovery power-on so a user "WiFi off" during a
+  // recovery cycle is not silently reversed by _serviceDisconnectRecovery().
+  // Recovery paths that intend a power-cycle re-arm _turnOnAfterMs AFTER _doOff().
+  _turnOnAfterMs = 0;
   WiFi.disconnect(false, false);
   WiFi.mode(WIFI_OFF);
   _state = WiFiState::WiFiOff;
@@ -640,6 +699,7 @@ void NetLink::_doDisconnect()
   _resetScheduler();
   _connectInProgress = false;
   _retryConnectAt = 0;
+  _turnOnAfterMs = 0; // FIX (B4): cancel any pending recovery power-on
   WiFi.disconnect(false, false);
   _state = WiFiState::WiFiDisconnected;
   _disconnectionStartTime = millis();
@@ -719,7 +779,12 @@ void NetLink::_scanTaskEntry(void *param)
         continue;
 
       taskManager.noteHeartbeat();
+      // FIX (B2): flag the radio busy across the blocking scan so loop() defers
+      // its radio commands and beginScan() waits, preventing concurrent radio
+      // access that can abort the scan or assert the driver.
+      self->_scanRadioBusy = true;
       const int8_t result = WiFi.scanNetworks();
+      self->_scanRadioBusy = false;
 
       if (result == 0)
       {
@@ -787,6 +852,10 @@ void NetLink::_scheduleConnectRetry(const char *reason, uint32_t delayMs)
   _attemptStartMs = 0;
   _nextAttemptAt = 0;
   _retryConnectAt = millis() + delayMs;
+  // FIX (B5): 0 is the "inactive" sentinel; bias a computed deadline of exactly 0
+  // to 1 so an armed timer is never mistaken for disarmed (permanent strand).
+  if (_retryConnectAt == 0)
+    _retryConnectAt = 1;
   WiFi.disconnect(false, false);
   debugW("%s Retrying WiFi connect loop in %lu ms.", reason,
          static_cast<unsigned long>(delayMs));
@@ -1043,8 +1112,12 @@ bool NetLink::_startNextAttempt()
   // rescan reuses the same wedged driver state and loops forever, so power-cycle
   // the whole WiFi stack here. _serviceDisconnectRecovery() turns the radio back
   // on after WIFI_RECONNECT_POWER_CYCLE_DELAY_MS and reconnects from scratch.
-  _turnOnAfterMs = millis() + WIFI_RECONNECT_POWER_CYCLE_DELAY_MS;
+  // FIX (B4): arm the recovery power-on AFTER _doOff() (which now clears
+  // _turnOnAfterMs). FIX (B5): keep 0 reserved as the "inactive" sentinel.
   _doOff();
+  _turnOnAfterMs = millis() + WIFI_RECONNECT_POWER_CYCLE_DELAY_MS;
+  if (_turnOnAfterMs == 0)
+    _turnOnAfterMs = 1;
   debugW("All WiFi candidates exhausted. Restarting WiFi stack; reconnecting in %lu ms.",
          static_cast<unsigned long>(WIFI_RECONNECT_POWER_CYCLE_DELAY_MS));
   return false;
@@ -1070,6 +1143,8 @@ bool NetLink::_failCurrentAttempt(const char *reason)
   WiFi.disconnect(false, false);
   _attemptStartMs = 0;
   _nextAttemptAt = millis() + WIFI_ATTEMPT_BACKOFF_MS;
+  if (_nextAttemptAt == 0) // FIX (B5): keep 0 reserved as the "inactive" sentinel
+    _nextAttemptAt = 1;
   return true;
 }
 
@@ -1081,7 +1156,7 @@ void NetLink::_serviceConnectionAttempt()
   const unsigned long now = millis();
   if (!_connectInProgress)
   {
-    if (_retryConnectAt != 0 && now >= _retryConnectAt)
+    if (_retryConnectAt != 0 && (int32_t)(now - _retryConnectAt) >= 0) // FIX (B5): wrap-safe
     {
       _retryConnectAt = 0;
       _doConnect();
@@ -1098,7 +1173,7 @@ void NetLink::_serviceConnectionAttempt()
   // Backoff window between attempts (set by _failCurrentAttempt).
   if (_nextAttemptAt != 0)
   {
-    if (now >= _nextAttemptAt)
+    if ((int32_t)(now - _nextAttemptAt) >= 0) // FIX (B5): wrap-safe
     {
       _nextAttemptAt = 0;
       _startNextAttempt();
@@ -1108,7 +1183,7 @@ void NetLink::_serviceConnectionAttempt()
 
   if (_plan.empty())
   {
-    if (_retryConnectAt != 0 && now < _retryConnectAt)
+    if (_retryConnectAt != 0 && (int32_t)(now - _retryConnectAt) < 0) // FIX (B5): wrap-safe
       return;
 
     // Defensive: if we ended up here without a plan or pending scan,
@@ -1230,15 +1305,19 @@ void NetLink::_serviceDisconnectRecovery()
 
   if (disconnectedTooLong || connectingTooLong)
   {
-    _turnOnAfterMs = now + WIFI_RECONNECT_POWER_CYCLE_DELAY_MS;
+    // FIX (B4): arm the recovery power-on AFTER _doOff() (which now clears
+    // _turnOnAfterMs). FIX (B5): keep 0 reserved as the "inactive" sentinel.
     _doOff();
+    _turnOnAfterMs = now + WIFI_RECONNECT_POWER_CYCLE_DELAY_MS;
+    if (_turnOnAfterMs == 0)
+      _turnOnAfterMs = 1;
     if (connectingTooLong)
       debugI("WiFi connecting state stuck too long. Cycling radio.");
     else
       debugI("WiFi disconnected for too long. Cycling radio.");
   }
 
-  if (_turnOnAfterMs > 0 && now > _turnOnAfterMs)
+  if (_turnOnAfterMs > 0 && (int32_t)(now - _turnOnAfterMs) > 0) // FIX (B5): wrap-safe
   {
     _turnOnAfterMs = 0;
     _doOn();
