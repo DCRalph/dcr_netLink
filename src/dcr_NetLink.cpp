@@ -9,6 +9,8 @@
 #include <dcr_Logger.h>
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "esp_task.h"
+#include "ping/ping_sock.h"
 #include <ArduinoJson.h>
 #include <algorithm>
 #include <atomic>
@@ -67,6 +69,37 @@ namespace
   // Reason code of the most recent STA_DISCONNECTED event, for attempt-failure
   // logging. Written by the WiFi event task, read by the scheduler.
   std::atomic<uint8_t> s_lastDisconnectReason{0};
+
+  // True between GOT_IP and the next STA_DISCONNECTED / LOST_IP. WiFi.status()
+  // is not cleared on an AUTH_EXPIRE deauth (arduino-esp32 2.0.17 leaves that
+  // branch empty), so it is not a usable liveness signal on its own.
+  std::atomic<bool> s_staHasIp{false};
+
+  // Gateway reachability probe. Association plus a DHCP lease does not prove
+  // the path works: a wedged AP keeps the link up while dropping all traffic.
+  constexpr uint32_t WIFI_LINK_PROBE_INTERVAL_MS = 120000;
+  constexpr uint32_t WIFI_LINK_PROBE_SETTLE_MS = 15000;
+  constexpr uint32_t WIFI_LINK_PROBE_DEADLINE_MS = 10000;
+  constexpr uint8_t WIFI_LINK_PROBE_FAILURES = 3;
+
+  // esp_ping_delete_session() lets its task exit asynchronously, so a torn-down
+  // session's callbacks can still land. They carry their generation in cb_args
+  // and are ignored once it no longer matches.
+  std::atomic<uint32_t> s_probeGeneration{0};
+  std::atomic<uint32_t> s_probeReplies{0};
+  std::atomic<bool> s_probeDone{false};
+
+  void onProbeSuccess(esp_ping_handle_t, void *args)
+  {
+    if (reinterpret_cast<uintptr_t>(args) == s_probeGeneration.load(std::memory_order_relaxed))
+      s_probeReplies.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  void onProbeEnd(esp_ping_handle_t, void *args)
+  {
+    if (reinterpret_cast<uintptr_t>(args) == s_probeGeneration.load(std::memory_order_relaxed))
+      s_probeDone.store(true, std::memory_order_release);
+  }
 
   String formatBssid(const uint8_t *bssid)
   {
@@ -237,6 +270,7 @@ namespace
 
             case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
                 s_dnsOverrideApplied = false;
+                s_staHasIp.store(false, std::memory_order_relaxed);
                 s_lastDisconnectReason.store(info.wifi_sta_disconnected.reason,
                                              std::memory_order_relaxed);
                 s_disconnectEventSeq.fetch_add(1, std::memory_order_relaxed);
@@ -249,6 +283,7 @@ namespace
 
             case ARDUINO_EVENT_WIFI_STA_GOT_IP:
             {
+                s_staHasIp.store(true, std::memory_order_relaxed);
                 IPAddress dns1 = WiFi.dnsIP(0);
                 IPAddress dns2 = WiFi.dnsIP(1);
                 debugI("GOT_IP | IP %s | GW %s | DNS(dhcp) %s, %s",
@@ -280,6 +315,7 @@ namespace
 
             case ARDUINO_EVENT_WIFI_STA_LOST_IP:
                 s_dnsOverrideApplied = false;
+                s_staHasIp.store(false, std::memory_order_relaxed);
                 debugW("LOST_IP | DHCP renewal failed");
                 break;
 
@@ -326,7 +362,7 @@ uint32_t NetLink::disconnectEventSeq() const
 
 bool NetLink::isConnected() const
 {
-  return WiFi.isConnected();
+  return WiFi.isConnected() && s_staHasIp.load(std::memory_order_relaxed);
 }
 
 int NetLink::rssi() const
@@ -466,9 +502,13 @@ void NetLink::loop()
     playConnectedBuzzer = true;
   }
 
-  // 5. Recovery: cycle the radio after prolonged disconnection.
+  // 5. Recovery: cycle the radio after prolonged disconnection, and probe the
+  //    gateway while connected.
   if (!_scanInProgress)
+  {
     _serviceDisconnectRecovery();
+    _serviceLinkProbe();
+  }
   if (auto detailsLock = FreeRtosRaii::tryLock(cachedDetailsMutex(), pdMS_TO_TICKS(50)))
     _cachedDetails = current;
 
@@ -576,6 +616,7 @@ void NetLink::beginScan()
   _pending = PendingNone;
   _bootAutoConnectPending = false;
   _bootAutoConnectAt = 0;
+  _stopLinkProbe();
   _resetScheduler();
   _connectInProgress = false;
   if (_cb.onClosePopup) _cb.onClosePopup("wifi_turn_on");
@@ -627,6 +668,7 @@ void NetLink::_doOff()
   _pending &= ~PendingConnect;
   _bootAutoConnectPending = false;
   _bootAutoConnectAt = 0;
+  _stopLinkProbe();
   _resetScheduler();
   _connectInProgress = false;
   _retryConnectAt = 0;
@@ -641,6 +683,7 @@ void NetLink::_doConnect()
 {
   _bootAutoConnectPending = false;
   _bootAutoConnectAt = 0;
+  _stopLinkProbe();
   _resetScheduler();
   _attemptStartMs = 0;
   _retryConnectAt = 0;
@@ -667,6 +710,7 @@ void NetLink::_doDisconnect()
 {
   _bootAutoConnectPending = false;
   _bootAutoConnectAt = 0;
+  _stopLinkProbe();
   _resetScheduler();
   _connectInProgress = false;
   _retryConnectAt = 0;
@@ -943,29 +987,14 @@ bool NetLink::_buildPlanFromScan(int8_t scanResult)
                        return a.rssi > b.rssi;
                      });
 
-    // Hidden networks do not appear in passive scan results. Always append a
-    // wildcard candidate (zero BSSID / channel 0) so _startNextAttempt issues
-    // WiFi.begin(ssid, password) and the driver actively probes for it.
-    // Visible networks get the same wildcard as a last-resort fallback: it
-    // covers APs that changed channel since the scan and lets the driver pick
-    // any AP of the SSID instead of the pinned ones.
-    if (net.hidden || !plan.candidates.empty())
-    {
-      plan.candidates.push_back(BssidCandidate{});
-      debugI("Queued wildcard candidate for SSID %s%s.", plan.ssid.c_str(),
-             net.hidden ? " (hidden)" : "");
-    }
+    // Every SSID ends with a wildcard candidate (zero BSSID / channel 0) so
+    // _startNextAttempt issues WiFi.begin(ssid, password) and the driver probes
+    // actively: covers hidden SSIDs, channel changes, and missed scan sweeps.
+    plan.candidates.push_back(BssidCandidate{});
 
-    if (!plan.candidates.empty())
-    {
-      anyCandidates = true;
-      debugI("Built BSSID queue for %s with %d candidate(s).", plan.ssid.c_str(), plan.candidates.size());
-    }
-    else
-    {
-      debugI("Scan produced no usable BSSIDs for SSID %s.", plan.ssid.c_str());
-      continue;
-    }
+    anyCandidates = true;
+    debugI("Built BSSID queue for %s with %d candidate(s), last is wildcard.",
+           plan.ssid.c_str(), plan.candidates.size());
 
     _plan.push_back(plan);
   }
@@ -1174,7 +1203,13 @@ void NetLink::_serviceConnectionAttempt()
 
 void NetLink::_refreshConnectionState()
 {
-  if (WiFi.status() == WL_CONNECTED)
+  // An AUTH_EXPIRE deauth leaves WiFi.status() at WL_CONNECTED, and the core
+  // auto-reconnect that normally hides that is disabled here. The GOT_IP /
+  // STA_DISCONNECTED flag is the only signal that tracks every drop.
+  const bool linkUp = WiFi.status() == WL_CONNECTED &&
+                      s_staHasIp.load(std::memory_order_relaxed);
+
+  if (linkUp)
   {
     if (_state != WiFiState::WiFiConnected)
     {
@@ -1280,6 +1315,117 @@ void NetLink::_serviceDisconnectRecovery()
     _doOn();
     debugI("WiFi turned back on after recovery delay.");
   }
+}
+
+void NetLink::_stopLinkProbe()
+{
+  if (_probeSession)
+  {
+    s_probeGeneration.fetch_add(1, std::memory_order_relaxed);
+    esp_ping_stop(_probeSession);
+    esp_ping_delete_session(_probeSession);
+    _probeSession = nullptr;
+  }
+  _probeDeadline = 0;
+}
+
+void NetLink::_serviceLinkProbe()
+{
+  if (_state != WiFiState::WiFiConnected)
+  {
+    _stopLinkProbe();
+    _probeFailStreak = 0;
+    _probeNextAt = 0;
+    _probeSupport = ProbeSupport::Unknown;
+    return;
+  }
+
+  if (_probeSupport == ProbeSupport::Unsupported)
+    return;
+
+  const unsigned long now = millis();
+
+  if (_probeSession)
+  {
+    if (!s_probeDone.load(std::memory_order_acquire) &&
+        (int32_t)(now - _probeDeadline) < 0)
+      return;
+
+    const uint32_t replies = s_probeReplies.load(std::memory_order_relaxed);
+    _stopLinkProbe();
+    _probeNextAt = now + WIFI_LINK_PROBE_INTERVAL_MS;
+
+    if (replies > 0)
+    {
+      _probeSupport = ProbeSupport::Supported;
+      _probeFailStreak = 0;
+      return;
+    }
+
+    // Silence from a gateway that has never answered means ICMP is filtered,
+    // not that the link is dead.
+    if (_probeSupport != ProbeSupport::Supported)
+    {
+      _probeSupport = ProbeSupport::Unsupported;
+      debugI("Gateway does not answer ICMP; link probe off for this association.");
+      return;
+    }
+
+    ++_probeFailStreak;
+    debugW("Gateway probe got no reply (%u/%u).",
+           static_cast<unsigned>(_probeFailStreak),
+           static_cast<unsigned>(WIFI_LINK_PROBE_FAILURES));
+    if (_probeFailStreak >= WIFI_LINK_PROBE_FAILURES)
+    {
+      _probeFailStreak = 0;
+      debugE("Gateway unreachable while associated. Forcing reconnect.");
+      requestSilentReconnect();
+    }
+    return;
+  }
+
+  if (_probeNextAt == 0)
+  {
+    _probeNextAt = now + WIFI_LINK_PROBE_SETTLE_MS;
+    return;
+  }
+  if ((int32_t)(now - _probeNextAt) < 0)
+    return;
+
+  const IPAddress gateway = WiFi.gatewayIP();
+  if (gateway == IPAddress(0, 0, 0, 0))
+  {
+    _probeNextAt = now + WIFI_LINK_PROBE_INTERVAL_MS;
+    return;
+  }
+
+  esp_ping_config_t cfg = ESP_PING_DEFAULT_CONFIG();
+  cfg.count = 3;
+  cfg.interval_ms = 500;
+  cfg.timeout_ms = 1000;
+  cfg.data_size = 32;
+  cfg.target_addr.type = ESP_IPADDR_TYPE_V4;
+  cfg.target_addr.u_addr.ip4.addr = static_cast<uint32_t>(gateway);
+
+  esp_ping_callbacks_t cbs = {};
+  cbs.cb_args = reinterpret_cast<void *>(
+      static_cast<uintptr_t>(s_probeGeneration.load(std::memory_order_relaxed)));
+  cbs.on_ping_success = onProbeSuccess;
+  cbs.on_ping_end = onProbeEnd;
+
+  s_probeReplies.store(0, std::memory_order_relaxed);
+  s_probeDone.store(false, std::memory_order_relaxed);
+
+  if (esp_ping_new_session(&cfg, &cbs, &_probeSession) != ESP_OK ||
+      esp_ping_start(_probeSession) != ESP_OK)
+  {
+    debugW("Gateway probe could not start.");
+    _stopLinkProbe();
+    _probeNextAt = now + WIFI_LINK_PROBE_INTERVAL_MS;
+    return;
+  }
+
+  _probeDeadline = now + WIFI_LINK_PROBE_DEADLINE_MS;
 }
 
 void NetLink::_serviceBootAutoConnect()

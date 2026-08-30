@@ -5,6 +5,8 @@
 #include <atomic>
 #include <vector>
 
+#include "ping/ping_sock.h"
+
 #include "dcr_INetLink.h"
 #include "dcr_NetLinkEvents.h"
 
@@ -180,6 +182,8 @@ private:
     void _refreshConnectionState();
     void _checkTimeouts();
     void _serviceDisconnectRecovery();
+    void _serviceLinkProbe();
+    void _stopLinkProbe();
     void _serviceBootAutoConnect();
     WiFiDetails _buildStatus() const;
 
@@ -229,6 +233,21 @@ private:
     unsigned long _timeConnectedMs = 0;
     unsigned long _disconnectionStartTime = 0;
     unsigned long _turnOnAfterMs = 0;
+
+    // Gateway reachability probe; runs only while WiFiConnected. Reset on
+    // every association, since ICMP filtering is a property of the network.
+    enum class ProbeSupport : uint8_t
+    {
+        Unknown,
+        Supported,
+        Unsupported,
+    };
+
+    esp_ping_handle_t _probeSession = nullptr;
+    unsigned long _probeNextAt = 0;
+    unsigned long _probeDeadline = 0;
+    uint8_t _probeFailStreak = 0;
+    ProbeSupport _probeSupport = ProbeSupport::Unknown;
 
     // External (UI-driven) scan flag.
     bool _scanInProgress = false;
