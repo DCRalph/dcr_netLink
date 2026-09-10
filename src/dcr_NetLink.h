@@ -24,6 +24,8 @@
 #define WIFI_CONNECTING_RECOVERY_GRACE_MS 300000UL
 // After turning the radio off for recovery, wait this long before turning back on.
 #define WIFI_RECONNECT_POWER_CYCLE_DELAY_MS 1000UL
+// After three sweeps that found nothing to join, pause this long between sweeps.
+#define WIFI_SWEEP_BACKOFF_MS 30000UL
 // Delay first auto-connect at boot by this long (lets other tasks settle).
 #define WIFI_BOOT_CONNECT_DELAY_MS 3000UL
 
@@ -218,6 +220,8 @@ private:
     unsigned long _nextAttemptAt = 0;
     uint32_t _attemptDisconnectBaselineSeq = 0;
     bool _connectInProgress = false;
+    // Consecutive sweeps that exhausted every candidate; reset on association.
+    uint8_t _sweepFailures = 0;
 
     // Async scan task lifecycle.
     TaskHandle_t _scanTask = nullptr;

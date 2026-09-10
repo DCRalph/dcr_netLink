@@ -116,7 +116,10 @@ namespace
     return dns != IPAddress(0, 0, 0, 0);
   }
 
-  bool ensureBackupDns()
+  // Third resolver slot, behind both DHCP servers: lwip only asks it once the
+  // provider resolvers have timed out, so a filtering or dead site DNS does
+  // not take the API host down with it.
+  bool ensureFallbackDns()
   {
     esp_netif_t *staNetif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (!staNetif)
@@ -125,7 +128,7 @@ namespace
     esp_netif_dns_info_t dns = {};
     dns.ip.type = ESP_IPADDR_TYPE_V4;
     dns.ip.u_addr.ip4.addr = static_cast<uint32_t>(IPAddress(1, 1, 1, 1));
-    return esp_netif_set_dns_info(staNetif, ESP_NETIF_DNS_BACKUP, &dns) == ESP_OK;
+    return esp_netif_set_dns_info(staNetif, ESP_NETIF_DNS_FALLBACK, &dns) == ESP_OK;
   }
 
   bool applyFallbackDns()
@@ -296,8 +299,8 @@ namespace
 
                 if (hasUsableDns(dns1) || hasUsableDns(dns2))
                 {
-                    if (hasUsableDns(dns1) && !hasUsableDns(dns2) && ensureBackupDns())
-                        debugI("DHCP DNS present; added public backup DNS (1.1.1.1)");
+                    if (ensureFallbackDns())
+                        debugI("DHCP DNS present; added public fallback DNS (1.1.1.1)");
                     else
                         debugI("DHCP DNS present; keeping provider DNS");
                     s_dnsOverrideApplied = true;
@@ -524,6 +527,7 @@ void NetLink::loop()
 
 void NetLink::on()
 {
+  _sweepFailures = 0;
   _pending |= PendingTurnOn;
   if (_cb.onShowPopup)
     _cb.onShowPopup("wifi_turn_on", "WiFi Turn On", "Please Wait...");
@@ -538,6 +542,7 @@ void NetLink::off()
 
 void NetLink::connect()
 {
+  _sweepFailures = 0;
   _pending |= PendingConnect;
   if (_cb.onShowPopup)
     _cb.onShowPopup("wifi_connect", "WiFi Connect", "Please Wait...");
@@ -1102,12 +1107,17 @@ bool NetLink::_startNextAttempt()
   _scanPending = false;
   debugI("Exhausted all WiFi candidates.");
 
+  if (_sweepFailures < 255)
+    ++_sweepFailures;
+  const unsigned long delayMs = _sweepFailures <= 3 ? WIFI_RECONNECT_POWER_CYCLE_DELAY_MS
+                                                     : WIFI_SWEEP_BACKOFF_MS;
+
   _doOff();
-  _turnOnAfterMs = millis() + WIFI_RECONNECT_POWER_CYCLE_DELAY_MS;
+  _turnOnAfterMs = millis() + delayMs;
   if (_turnOnAfterMs == 0)
     _turnOnAfterMs = 1;
-  debugW("All WiFi candidates exhausted. Restarting WiFi stack; reconnecting in %lu ms.",
-         static_cast<unsigned long>(WIFI_RECONNECT_POWER_CYCLE_DELAY_MS));
+  debugW("All WiFi candidates exhausted (sweep %u). Restarting WiFi stack; reconnecting in %lu ms.",
+         static_cast<unsigned>(_sweepFailures), delayMs);
   return false;
 }
 
@@ -1219,6 +1229,7 @@ void NetLink::_refreshConnectionState()
       _disconnectionStartTime = 0;
       _usingFactoryCreds = wasFactory;
       _connectInProgress = false;
+      _sweepFailures = 0;
       _plan.clear();
       _planIdx = 0;
       _candidateIdx = 0;
@@ -1790,6 +1801,7 @@ bool NetLink::saveCredentials(const char *ssid, const char *password, bool hidde
   if (auto lock = FreeRtosRaii::tryLock(wifiLoopMutex(), pdMS_TO_TICKS(3000)))
   {
     _resetScheduler();
+    _sweepFailures = 0;
 
     const bool skipReconnect = (_cb.isCellularPreferred && _cb.isCellularPreferred());
 
