@@ -98,12 +98,14 @@ public:
     void off();
     void connect();
     void disconnect();
-    // Queue a disconnect+connect cycle without surfacing user-facing
-    // popups. Intended for background recovery (e.g. low-heap reset)
-    // where popping a "Please Wait" dialog over the user's current
-    // screen would be unexpected.
+    // Queue a disconnect+connect cycle. Intended for background recovery,
+    // e.g. a low-heap reset.
     void requestSilentReconnect();
     void resetConfig();
+
+    // True while a queued command has not yet been applied by loop(). UI that
+    // mirrors the radio should hold the requested position until this clears.
+    bool isCommandPending() const { return _pending.load() != PendingNone; }
 
     // Synchronous shutdown for cellular handover. Caller must ensure no
     // concurrent loop() is running; the timeout fallback is last-resort only.
@@ -130,10 +132,11 @@ public:
     static uint32_t globalDisconnectEventSeq();
 
     // === External (UI-driven) scan flow ===
-    // Pause auto-reconnect, cycle the radio, hand control to the UI for
-    // WiFi.scanNetworks(). endScan() resumes auto-reconnect.
+    // beginScan() returns immediately; loop() cycles the radio and then raises
+    // isScanReady(). Call WiFi.scanNetworks() only once that is true.
     void beginScan();
     void endScan();
+    bool isScanReady() const { return _scanRadioHandedOver.load(); }
 
 
 private:
@@ -161,6 +164,7 @@ private:
         PendingTurnOff = 1 << 1,
         PendingConnect = 1 << 2,
         PendingDisconnect = 1 << 3,
+        PendingScan = 1 << 4,
     };
 
     // === Internal transitions (mutex must be held) ===
@@ -168,6 +172,7 @@ private:
     void _doOff();
     void _doConnect();
     void _doDisconnect();
+    void _doScanHandover();
     // === Connection scheduler (mutex must be held) ===
     void _resetScheduler();
     bool _ensureScanTaskStarted();
@@ -254,7 +259,8 @@ private:
     ProbeSupport _probeSupport = ProbeSupport::Unknown;
 
     // External (UI-driven) scan flag.
-    bool _scanInProgress = false;
+    std::atomic<bool> _scanInProgress{false};
+    std::atomic<bool> _scanRadioHandedOver{false};
 
     bool _usingFactoryCreds = false;
 

@@ -17,12 +17,6 @@ struct NetLinkCallbacks
   std::function<void()> onScanStarted;
   std::function<void()> onScanCompleted;
 
-  // Replaces direct Popups::showPopup / closePopup calls. The id can be used
-  // by the UI to match a later onClosePopup against the popup created by an
-  // earlier onShowPopup.
-  std::function<void(const String &id, const String &title, const String &message)> onShowPopup;
-  std::function<void(const String &id)> onClosePopup;
-
   // Replaces direct Buzzer::play call when a connection comes up.
   std::function<void()> onBuzz;
 

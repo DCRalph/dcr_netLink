@@ -433,31 +433,40 @@ void NetLink::loop()
     return;
   }
 
-  // 1. Process pending commands.
+  // 1. Process pending commands. Snapshot-and-clear in one step so a command
+  //    issued while this block runs is kept for the next iteration.
   if (!_scanRadioBusy)
   {
-    if (_pending & PendingTurnOn)
+    const uint8_t pending = _pending.exchange(PendingNone);
+
+    // A scan handover supersedes the radio commands it was queued alongside:
+    // beginScan() hands the radio to the UI, and endScan() re-queues a connect.
+    if (pending & PendingScan)
     {
-      _doOn();
-      if (_cb.onClosePopup) _cb.onClosePopup("wifi_turn_on");
+      _doScanHandover();
     }
-    if (_pending & PendingTurnOff)
+    else
     {
-      _doOff();
-      if (_cb.onClosePopup) _cb.onClosePopup("wifi_turn_off");
+      bool wantConnect = (pending & PendingConnect) != 0;
+
+      if (pending & PendingTurnOn)
+        _doOn();
+      if (pending & PendingTurnOff)
+      {
+        _doOff();
+        wantConnect = false;
+      }
+      if (pending & PendingDisconnect)
+        _doDisconnect();
+
+      if (wantConnect)
+      {
+        if (_scanInProgress)
+          _pending |= PendingConnect;
+        else
+          _doConnect();
+      }
     }
-    if (_pending & PendingDisconnect)
-    {
-      _doDisconnect();
-      if (_cb.onClosePopup) _cb.onClosePopup("wifi_disconnect");
-    }
-    if ((_pending & PendingConnect) && !_scanInProgress)
-    {
-      _doConnect();
-      if (_cb.onClosePopup) _cb.onClosePopup("wifi_connect");
-      _pending &= ~PendingConnect;
-    }
-    _pending &= ~(PendingTurnOn | PendingTurnOff | PendingDisconnect);
   }
 
   // 2. Boot delay and connection state machine.
@@ -527,33 +536,35 @@ void NetLink::loop()
 
 void NetLink::on()
 {
+  if (_state != WiFiState::WiFiOff && !(_pending.load() & PendingTurnOff))
+    return;
+
   _sweepFailures = 0;
+  _pending &= ~PendingTurnOff;
   _pending |= PendingTurnOn;
-  if (_cb.onShowPopup)
-    _cb.onShowPopup("wifi_turn_on", "WiFi Turn On", "Please Wait...");
+  debugI("WiFi turn on requested");
 }
 
 void NetLink::off()
 {
+  if (_state == WiFiState::WiFiOff && !(_pending.load() & PendingTurnOn))
+    return;
+
+  _pending &= ~(PendingTurnOn | PendingConnect);
   _pending |= PendingTurnOff;
-  if (_cb.onShowPopup)
-    _cb.onShowPopup("wifi_turn_off", "WiFi Turn Off", "Please Wait...");
+  debugI("WiFi turn off requested");
 }
 
 void NetLink::connect()
 {
   _sweepFailures = 0;
   _pending |= PendingConnect;
-  if (_cb.onShowPopup)
-    _cb.onShowPopup("wifi_connect", "WiFi Connect", "Please Wait...");
   debugI("WiFi connection requested");
 }
 
 void NetLink::disconnect()
 {
   _pending |= PendingDisconnect;
-  if (_cb.onShowPopup)
-    _cb.onShowPopup("wifi_disconnect", "WiFi Disconnect", "Please Wait...");
   debugI("WiFi disconnect requested");
 }
 
@@ -584,12 +595,14 @@ void NetLink::prepareForExternalTransport()
     _turnOnAfterMs = 0;
     _disconnectionStartTime = 0;
     _pending = PendingNone;
+    _scanRadioHandedOver = false;
     _doOff();
     return;
   }
 
   debugE("prepareForExternalTransport: mutex timeout; forcing radio off.");
   _pending = PendingNone;
+  _scanRadioHandedOver = false;
   vTaskDelay(pdMS_TO_TICKS(50));
   WiFi.disconnect(false, false);
   WiFi.mode(WIFI_OFF);
@@ -610,47 +623,21 @@ WiFiDetails NetLink::getStatus()
 
 void NetLink::beginScan()
 {
-  auto lock = FreeRtosRaii::tryLock(wifiLoopMutex(), pdMS_TO_TICKS(6000));
-  if (!lock)
-  {
-    debugE("beginScan: mutex timeout");
-    return;
-  }
-
+  // Callers run on the UI task; the radio cycle is blocking, so only flag the
+  // request here and let loop() do the work. Poll isScanReady() before scanning.
   _scanInProgress = true;
-  _pending = PendingNone;
-  _bootAutoConnectPending = false;
-  _bootAutoConnectAt = 0;
-  _stopLinkProbe();
-  _resetScheduler();
-  _connectInProgress = false;
-  if (_cb.onClosePopup) _cb.onClosePopup("wifi_turn_on");
-
-  for (int i = 0; i < 40 && _scanRadioBusy; ++i)
-    delay(100);
-
-  WiFi.disconnect(true, true);
-  WiFi.mode(WIFI_OFF);
-  delay(100);
-  configureStationMode();
-  WiFi.setSleep(_cb.isBleActive && _cb.isBleActive());
-  _state = WiFiState::WiFiDisconnected;
-  _disconnectionStartTime = 0;
+  _scanRadioHandedOver = false;
+  _pending = PendingScan;
 }
 
 void NetLink::endScan()
 {
-  auto lock = FreeRtosRaii::tryLock(wifiLoopMutex(), pdMS_TO_TICKS(6000));
-  if (!lock)
-  {
-    debugE("endScan: mutex timeout");
+  if (!_scanInProgress.exchange(false))
     return;
-  }
-  if (_scanInProgress)
-  {
-    _scanInProgress = false;
-    _pending |= PendingConnect;
-  }
+
+  _scanRadioHandedOver = false;
+  _pending &= ~PendingScan;
+  _pending |= PendingConnect;
 }
 
 // =============================================================================
@@ -709,6 +696,29 @@ void NetLink::_doConnect()
 
   debugI("Starting WiFi scheduler with %d candidate SSIDs.", networks.size());
   _startScan();
+}
+
+// Cycle the radio and leave it idle so the UI can drive WiFi.scanNetworks().
+void NetLink::_doScanHandover()
+{
+  _bootAutoConnectPending = false;
+  _bootAutoConnectAt = 0;
+  _stopLinkProbe();
+  _resetScheduler();
+  _connectInProgress = false;
+  _retryConnectAt = 0;
+  _turnOnAfterMs = 0;
+
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_OFF);
+  delay(100);
+  configureStationMode();
+  WiFi.setSleep(_cb.isBleActive && _cb.isBleActive());
+  _state = WiFiState::WiFiDisconnected;
+  _disconnectionStartTime = 0;
+
+  _scanRadioHandedOver = true;
+  debugI("WiFi radio handed to the UI scan flow");
 }
 
 void NetLink::_doDisconnect()
