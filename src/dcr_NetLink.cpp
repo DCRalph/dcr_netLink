@@ -49,7 +49,7 @@ namespace
   // AUTH_FAIL arrives trips auth rate-limiting on some APs, and band-steering
   // controllers deliberately reject the first rapid 2.4 GHz auth attempts.
   constexpr uint32_t WIFI_ATTEMPT_BACKOFF_MS = 1500;
-  constexpr uint32_t WIFI_SCAN_TASK_STACK_SIZE = 6144;
+  constexpr uint32_t WIFI_SCAN_TASK_STACK_SIZE = 3584;
   constexpr UBaseType_t WIFI_SCAN_TASK_PRIORITY = 1;
   constexpr BaseType_t WIFI_SCAN_TASK_CORE = tskNO_AFFINITY;
   constexpr uint32_t WIFI_SCAN_RETRY_MS = 3000;
